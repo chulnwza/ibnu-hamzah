@@ -54,3 +54,10 @@ DISCORD_TOKEN=your_token_here
 ```bash
 python main.py
 ```
+
+### ⌨️ Commands
+```plaintext
+/quran [1-114]      Opens the dashboard for a specific Surah to play or set ranges.
+/quran 0	          Full Quran Mode: Starts playing from Surah 1 to 114 continuously.
+/surah_list	        Displays the index of all 114 Surahs with pagination buttons
+```
