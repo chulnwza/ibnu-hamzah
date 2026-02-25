@@ -6,6 +6,15 @@ from the Quran.com API (for full surahs) and the Aladhan API (for specific ayahs
 """
 import aiohttp
 
+# Central mapping for reciters to their respective API IDs
+RECITER_MAPPING = {
+    "mishary": {"quran_com": 7, "aladhan": "ar.alafasy"},
+    "sudais": {"quran_com": 3, "aladhan": "ar.sudais"},
+    "maher": {"quran_com": 12, "aladhan": "ar.mahermuaiqly"},
+    "shuraim": {"quran_com": 4, "aladhan": "ar.shuraym"},
+    "ghamidi": {"quran_com": 5, "aladhan": "ar.ghamidi"},
+}
+
 async def get_full_surah_audio(surah_number: int, reciter_id: int) -> str:
     """
     Fetches the full surah audio URL from the Quran.com API.

@@ -6,14 +6,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.api_client import get_full_surah_audio, get_ayah_audio
+from utils.api_client import get_full_surah_audio, get_ayah_audio, RECITER_MAPPING
 from utils.surahs import SURAHS
-
-# Mapping from UI values/labels to API expected values
-RECITER_MAPPING = {
-    "mishary": {"quran_com": 7, "aladhan": "ar.alafasy"},
-    "abdul_baset": {"quran_com": 2, "aladhan": "ar.abdulbasitmurattal"},
-}
 
 class AyahRangeModal(discord.ui.Modal, title="Set Ayah Range"):
     start_ayah = discord.ui.TextInput(
@@ -51,6 +45,8 @@ class QuranDashboardView(discord.ui.View):
     def __init__(self, surah_number: int):
         super().__init__(timeout=None)
         self.surah_number = surah_number
+        self.is_full_quran = (surah_number == 0)
+        self.current_surah = 1 if self.is_full_quran else self.surah_number
         
         # Default selections
         self.start_ayah = None
@@ -64,8 +60,11 @@ class QuranDashboardView(discord.ui.View):
 
         # Select Reciter
         reciter_options = [
-            discord.SelectOption(label="Mishary Rashid Alafasy", value="mishary"),
-            discord.SelectOption(label="AbdulBaset AbdulSamad", value="abdul_baset"),
+            discord.SelectOption(label="Mishary Rashid Alafasy", value="mishary", description="Kuwait"),
+            discord.SelectOption(label="Abdul Rahman Al-Sudais", value="sudais", description="Mecca"),
+            discord.SelectOption(label="Maher Al-Muaiqly", value="maher", description="Mecca"),
+            discord.SelectOption(label="Saud Al-Shuraim", value="shuraim", description="Mecca"),
+            discord.SelectOption(label="Saad Al-Ghamidi", value="ghamidi", description="Dammam"),
         ]
         reciter_select = discord.ui.Select(
             placeholder="Select Reciter",
@@ -112,7 +111,10 @@ class QuranDashboardView(discord.ui.View):
         reciter_config = RECITER_MAPPING.get(self.selected_reciter, RECITER_MAPPING["mishary"])
 
         try:
-            if self.start_ayah is None or self.end_ayah is None:
+            if self.is_full_quran:
+                self.play_task = asyncio.create_task(self.play_full_quran_loop(interaction, voice_client, reciter_config["quran_com"]))
+                await interaction.edit_original_response(content="Starting Full Quran recitation...")
+            elif self.start_ayah is None or self.end_ayah is None:
                 # Play full surah
                 audio_url = await get_full_surah_audio(self.surah_number, reciter_config["quran_com"])
                 if not audio_url:
@@ -132,6 +134,41 @@ class QuranDashboardView(discord.ui.View):
                 
         except Exception as e:
             await interaction.edit_original_response(content=f"An error occurred: {e}")
+
+    async def play_full_quran_loop(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, reciter_id: int):
+        while self.current_surah <= 114:
+            if self.stop_event.is_set():
+                break
+                
+            try:
+                audio_url = await get_full_surah_audio(self.current_surah, reciter_id)
+                if not audio_url:
+                    self.current_surah += 1
+                    continue
+                
+                if audio_url.startswith("//"):
+                    audio_url = "https:" + audio_url
+                    
+                # wait until voice client is not playing before playing the next
+                while voice_client.is_playing():
+                    await asyncio.sleep(0.5)
+                    if self.stop_event.is_set():
+                        break
+                        
+                if self.stop_event.is_set():
+                    break
+                    
+                voice_client.play(discord.FFmpegPCMAudio(audio_url))
+                self.current_surah += 1
+            except Exception as e:
+                print(f"Failed to play Surah {self.current_surah}: {e}")
+                self.current_surah += 1
+                continue
+        
+        # Finished
+        if not self.stop_event.is_set():
+            if voice_client and voice_client.is_connected():
+                await voice_client.disconnect()
 
     async def play_queue(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, reciter_string: str):
         for ayah_num in range(self.start_ayah, self.end_ayah + 1):
@@ -208,25 +245,30 @@ class QuranDashboardCog(commands.Cog):
         self.bot = bot
 
     @app_commands.command(name="quran", description="Open the Quran Dashboard")
-    @app_commands.describe(surah_number="Enter a Surah number from 1 to 114")
+    @app_commands.describe(surah_number="Surah number 1-114, or 0 to play the entire Quran from the beginning")
     async def quran(self, interaction: discord.Interaction, surah_number: int):
         """
         Responds with an embed and a view to select reciter and play options.
         """
-        if surah_number < 1 or surah_number > 114:
-            await interaction.response.send_message("Surah number must be between 1 and 114.", ephemeral=True)
+        if surah_number < 0 or surah_number > 114:
+            await interaction.response.send_message("Surah number must be between 0 and 114.", ephemeral=True)
             return
             
-        embed = discord.Embed(
-            title=f"📖 Quran Dashboard (Surah {surah_number})",
-            description="Use the selection menu to choose a Reciter. You can set an Ayah range, or directly press play to listen to the full Surah.",
-            color=discord.Color.green()
-        )
-        if interaction.user.avatar:
-            embed.set_footer(text=f"Requested by {interaction.user.display_name}", icon_url=interaction.user.avatar.url)
+        if surah_number == 0:
+            embed = discord.Embed(
+                title="📖 Now Playing: The Noble Quran (Full Recitation)",
+                description="Use the selection menu to choose a Reciter, then press play to listen.",
+                color=discord.Color.green()
+            )
+            embed.set_footer(text=f"Current Progress: Surah 1 of 114 (Requested by {interaction.user.display_name})")
         else:
+            embed = discord.Embed(
+                title=f"📖 Quran Dashboard (Surah {surah_number})",
+                description="Use the selection menu to choose a Reciter. You can set an Ayah range, or directly press play to listen to the full Surah.",
+                color=discord.Color.green()
+            )
             embed.set_footer(text=f"Requested by {interaction.user.display_name}")
-        
+
         view = QuranDashboardView(surah_number)
         await interaction.response.send_message(embed=embed, view=view)
 
