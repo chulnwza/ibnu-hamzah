@@ -60,10 +60,8 @@ class QuranDashboardView(discord.ui.View):
 
         # Select Reciter
         reciter_options = [
+            discord.SelectOption(label="Mahmoud Khalil Al-Husary", value="husary", description="Egypt"),
             discord.SelectOption(label="Mishary Rashid Alafasy", value="mishary", description="Kuwait"),
-            discord.SelectOption(label="Abdul Rahman Al-Sudais", value="sudais", description="Mecca"),
-            discord.SelectOption(label="Maher Al-Muaiqly", value="maher", description="Mecca"),
-            discord.SelectOption(label="Saud Al-Shuraim", value="shuraim", description="Mecca"),
             discord.SelectOption(label="Saad Al-Ghamidi", value="ghamidi", description="Dammam"),
         ]
         reciter_select = discord.ui.Select(
@@ -78,7 +76,15 @@ class QuranDashboardView(discord.ui.View):
 
     async def reciter_callback(self, interaction: discord.Interaction):
         self.selected_reciter = interaction.data["values"][0]
-        await interaction.response.defer()
+        
+        # Persist UI selection
+        for child in self.children:
+            if getattr(child, "custom_id", None) == "reciter_select":
+                for opt in child.options:
+                    opt.default = (opt.value == self.selected_reciter)
+                break
+                
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="Set Ayah Range", style=discord.ButtonStyle.secondary, custom_id="range_button")
     async def range_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -149,7 +155,9 @@ class QuranDashboardView(discord.ui.View):
                 if audio_url.startswith("//"):
                     audio_url = "https:" + audio_url
                     
-                # wait until voice client is not playing before playing the next
+                voice_client.play(discord.FFmpegPCMAudio(audio_url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", options="-vn"))
+                
+                # The most stable way to wait for audio to finish
                 while voice_client.is_playing():
                     await asyncio.sleep(0.5)
                     if self.stop_event.is_set():
@@ -158,7 +166,6 @@ class QuranDashboardView(discord.ui.View):
                 if self.stop_event.is_set():
                     break
                     
-                voice_client.play(discord.FFmpegPCMAudio(audio_url))
                 self.current_surah += 1
             except Exception as e:
                 print(f"Failed to play Surah {self.current_surah}: {e}")
@@ -171,27 +178,45 @@ class QuranDashboardView(discord.ui.View):
                 await voice_client.disconnect()
 
     async def play_queue(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, reciter_string: str):
-        for ayah_num in range(self.start_ayah, self.end_ayah + 1):
-            if self.stop_event.is_set():
-                break
-                
+        start = self.start_ayah if self.start_ayah else 1
+        end = self.end_ayah if self.end_ayah else 286 # Start off high, loop breaks on 404
+        
+        for i in range(start, end + 1):
+            if self.stop_event.is_set(): break
+            
             try:
-                audio_url = await get_ayah_audio(self.surah_number, ayah_num, reciter_string)
-                if not audio_url:
-                    continue
-                
-                # wait until voice client is not playing before playing the next
-                while voice_client.is_playing():
-                    await asyncio.sleep(0.5)
-                    if self.stop_event.is_set():
+                url = await get_ayah_audio(self.surah_number, i, reciter_string)
+                if url:
+                    print(f"DEBUG: Attempting to play Surah {self.surah_number} Ayah {i} using URL: {url}")
+                    
+                    if not voice_client.is_connected() or self.stop_event.is_set():
                         break
                         
-                if self.stop_event.is_set():
-                    break
+                    # Basic FFmpeg play
+                    source = discord.FFmpegPCMAudio(url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", options="-vn")
+                    voice_client.play(source, after=lambda e: print(f'Finished playing: {e}') if e else None)
                     
-                voice_client.play(discord.FFmpegPCMAudio(audio_url))
+                    # Wait for audio to actually start playing (Timeout protecting)
+                    timeout = 0
+                    while not voice_client.is_playing() and timeout < 10:
+                        await asyncio.sleep(0.5)
+                        timeout += 1
+                        if self.stop_event.is_set():
+                            break
+                            
+                    if not voice_client.is_playing() and not self.stop_event.is_set():
+                        print(f"DEBUG: Timeout waiting for audio to start for Surah {self.surah_number} Ayah {i}. Skipping to next.")
+                        continue
+                        
+                    # The most stable way to wait for audio to finish
+                    while voice_client.is_playing():
+                        await asyncio.sleep(0.5)
+                        if self.stop_event.is_set():
+                            break
+                else:
+                    break # End of Surah
             except Exception as e:
-                print(f"Failed to play Ayah {ayah_num}: {e}")
+                print(f"Failed to play Ayah {i}: {e}")
                 continue
 
     @discord.ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="stop_button")
