@@ -6,7 +6,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from utils.api_client import get_full_surah_audio, get_ayah_audio, RECITER_MAPPING
+from utils.api_client import get_full_surah_audio, get_ayah_audio, get_translation_text, RECITER_MAPPING, TRANSLATION_MAPPING
 from utils.surahs import SURAHS
 
 class AyahRangeModal(discord.ui.Modal, title="Set Ayah Range"):
@@ -45,13 +45,15 @@ class QuranDashboardView(discord.ui.View):
     def __init__(self, surah_number: int):
         super().__init__(timeout=None)
         self.surah_number = surah_number
+        self.selected_reciter = "husary"
+        self.selected_language = "none"
         self.is_full_quran = (surah_number == 0)
         self.current_surah = 1 if self.is_full_quran else self.surah_number
         
         # Default selections
         self.start_ayah = None
         self.end_ayah = None
-        self.selected_reciter = "mishary"
+        self.selected_reciter = "husary"
         
         # Audio playback state
         self.audio_queue = []
@@ -59,11 +61,12 @@ class QuranDashboardView(discord.ui.View):
         self.stop_event = asyncio.Event()
 
         # Select Reciter
-        reciter_options = [
-            discord.SelectOption(label="Mahmoud Khalil Al-Husary", value="husary", description="Egypt"),
-            discord.SelectOption(label="Mishary Rashid Alafasy", value="mishary", description="Kuwait"),
-            discord.SelectOption(label="Saad Al-Ghamidi", value="ghamidi", description="Dammam"),
-        ]
+        reciter_options = []
+        for key, info in list(RECITER_MAPPING.items())[:25]:
+            reciter_options.append(
+                discord.SelectOption(label=info["name"], value=key, description=info.get("description", ""))
+            )
+            
         reciter_select = discord.ui.Select(
             placeholder="Select Reciter",
             min_values=1,
@@ -74,10 +77,24 @@ class QuranDashboardView(discord.ui.View):
         reciter_select.callback = self.reciter_callback
         self.add_item(reciter_select)
 
+        # Select Translation Language
+        lang_options = []
+        for key, info in TRANSLATION_MAPPING.items():
+            lang_options.append(discord.SelectOption(label=info['name'], value=key))
+                
+        lang_select = discord.ui.Select(
+            placeholder="Select Translation (Text)",
+            min_values=1,
+            max_values=1,
+            options=lang_options,
+            custom_id="lang_select"
+        )
+        lang_select.callback = self.lang_callback
+        self.add_item(lang_select)
+
     async def reciter_callback(self, interaction: discord.Interaction):
         self.selected_reciter = interaction.data["values"][0]
         
-        # Persist UI selection
         for child in self.children:
             if getattr(child, "custom_id", None) == "reciter_select":
                 for opt in child.options:
@@ -86,11 +103,32 @@ class QuranDashboardView(discord.ui.View):
                 
         await interaction.response.edit_message(view=self)
 
+    async def lang_callback(self, interaction: discord.Interaction):
+        self.selected_language = interaction.data["values"][0]
+        
+        for child in self.children:
+            if getattr(child, "custom_id", None) == "lang_select":
+                for opt in child.options:
+                    opt.default = (opt.value == self.selected_language)
+                break
+        
+        embed = interaction.message.embeds[0]
+        rec_name = RECITER_MAPPING.get(self.selected_reciter, {"name": "Mahmoud Khalil Al-Husary"})["name"]
+        
+        if self.is_full_quran:
+            self.selected_language = "none"
+            embed.description = f"👤 **Reciter:** {rec_name}\n🌍 **Translation:** ❌ ไม่แปล (Full Quran Mode bypasses translations to prevent queue locks)\n\nUse the selection menu to choose a Reciter, then press play to listen."
+        else:
+            lang_display = TRANSLATION_MAPPING.get(self.selected_language, {"name": "❌ ไม่แปล (No Translation)"})["name"]
+            embed.description = f"👤 **Reciter:** {rec_name}\n🌍 **Translation Language:** {lang_display}\n\nUse the selection menu to choose a Reciter. You can set an Ayah range, or directly press play to listen to the full Surah."
+            
+        await interaction.response.edit_message(embed=embed, view=self)
+
     @discord.ui.button(label="Set Ayah Range", style=discord.ButtonStyle.secondary, custom_id="range_button")
     async def range_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AyahRangeModal(self))
 
-    @discord.ui.button(label="▶️ Play Arabic", style=discord.ButtonStyle.primary, custom_id="play_button")
+    @discord.ui.button(label="▶️ Start Playback", style=discord.ButtonStyle.primary, custom_id="play_button")
     async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Play audio in voice channel."""
         if interaction.user.voice is None or interaction.user.voice.channel is None:
@@ -114,14 +152,14 @@ class QuranDashboardView(discord.ui.View):
 
         await interaction.response.send_message("Fetching audio...", ephemeral=True)
         
-        reciter_config = RECITER_MAPPING.get(self.selected_reciter, RECITER_MAPPING["mishary"])
+        reciter_config = RECITER_MAPPING.get(self.selected_reciter, RECITER_MAPPING["husary"])
 
         try:
             if self.is_full_quran:
                 self.play_task = asyncio.create_task(self.play_full_quran_loop(interaction, voice_client, reciter_config["quran_com"]))
                 await interaction.edit_original_response(content="Starting Full Quran recitation...")
-            elif self.start_ayah is None or self.end_ayah is None:
-                # Play full surah
+            elif self.selected_language == 'none' and (self.start_ayah is None or self.end_ayah is None):
+                # Play full surah efficiently natively
                 audio_url = await get_full_surah_audio(self.surah_number, reciter_config["quran_com"])
                 if not audio_url:
                     await interaction.edit_original_response(content="Could not retrieve full Surah audio URL.")
@@ -133,10 +171,12 @@ class QuranDashboardView(discord.ui.View):
                 voice_client.play(discord.FFmpegPCMAudio(audio_url))
                 await interaction.edit_original_response(content=f"Playing full Surah {self.surah_number}...")
             else:
-                # Play range
+                # Play range or Ayah-by-Ayah for translations
                 self.audio_queue = []
                 self.play_task = asyncio.create_task(self.play_queue(interaction, voice_client, reciter_config["aladhan"]))
-                await interaction.edit_original_response(content=f"Preparing to play Ayah {self.start_ayah} to {self.end_ayah}...")
+                start_str = self.start_ayah if self.start_ayah else 1
+                end_str = self.end_ayah if self.end_ayah else "End"
+                await interaction.edit_original_response(content=f"Preparing to play Surah {self.surah_number} (Ayah {start_str} to {end_str})...")
                 
         except Exception as e:
             await interaction.edit_original_response(content=f"An error occurred: {e}")
@@ -185,12 +225,45 @@ class QuranDashboardView(discord.ui.View):
             if self.stop_event.is_set(): break
             
             try:
+                # Prepare Language text if needed
+                translation_text = None
+                if self.selected_language != 'none':
+                    lang_code = TRANSLATION_MAPPING.get(self.selected_language, {}).get("aladhan")
+                    if lang_code:
+                        try:
+                            translation_text = await get_translation_text(self.surah_number, i, lang_code)
+                            if translation_text:
+                                # Strip HTML or footnotes gracefully if any
+                                translation_text = translation_text.replace("\n", " ").strip()
+                        except Exception as e:
+                            print(f"DEBUG: Failed to fetch translation text for Surah {self.surah_number} Ayah {i}: {e}")
+
+                # Arabic Part (Always plays)
                 url = await get_ayah_audio(self.surah_number, i, reciter_string)
                 if url:
-                    print(f"DEBUG: Attempting to play Surah {self.surah_number} Ayah {i} using URL: {url}")
+                    print(f"DEBUG: Playing Arabic for Surah {self.surah_number} Ayah {i} using URL: {url}")
                     
                     if not voice_client.is_connected() or self.stop_event.is_set():
                         break
+
+                    # Dynamically update the embed to show the translation while Arabic plays
+                    try:
+                        embed = interaction.message.embeds[0]
+                        lang_display = TRANSLATION_MAPPING.get(self.selected_language, {"name": "❌ ไม่แปล (No Translation)"})["name"]
+                        rec_name = RECITER_MAPPING.get(self.selected_reciter, {"name": "Unknown"})["name"]
+                        
+                        base_desc = f"👤 **Reciter:** {rec_name}\n🌍 **Translation Language:** {lang_display}\n\nYou can set an Ayah range, or directly press play to listen to the full Surah."
+                        new_desc = base_desc + f"\n\n📖 **Now Reciting:** Surah {self.surah_number}, Ayah {i}"
+                        
+                        if self.selected_language == 'none':
+                            new_desc += f"\n---\n📝 **Translation:** None"
+                        elif translation_text:
+                            new_desc += f"\n---\n📝 **Translation:** {translation_text}"
+                            
+                        embed.description = new_desc
+                        await interaction.edit_original_response(embed=embed, view=self)
+                    except Exception as e:
+                        print(f"DEBUG: Failed to update embed for Ayah {i}: {e}")
                         
                     # Basic FFmpeg play
                     source = discord.FFmpegPCMAudio(url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", options="-vn")
@@ -213,8 +286,11 @@ class QuranDashboardView(discord.ui.View):
                         await asyncio.sleep(0.5)
                         if self.stop_event.is_set():
                             break
+                            
+                    print(f"DEBUG: Arabic Finished for Surah {self.surah_number} Ayah {i}")
                 else:
                     break # End of Surah
+                        
             except Exception as e:
                 print(f"Failed to play Ayah {i}: {e}")
                 continue
@@ -282,14 +358,14 @@ class QuranDashboardCog(commands.Cog):
         if surah_number == 0:
             embed = discord.Embed(
                 title="📖 Now Playing: The Noble Quran (Full Recitation)",
-                description="Use the selection menu to choose a Reciter, then press play to listen.",
+                description="👤 **Reciter:** Mahmoud Khalil Al-Husary\n🌍 **Translation Language:** ❌ ไม่แปล (No Translation)\n\nUse the selection menu to choose a Reciter, then press play to listen.",
                 color=discord.Color.green()
             )
             embed.set_footer(text=f"Current Progress: Surah 1 of 114 (Requested by {interaction.user.display_name})")
         else:
             embed = discord.Embed(
                 title=f"📖 Quran Dashboard (Surah {surah_number})",
-                description="Use the selection menu to choose a Reciter. You can set an Ayah range, or directly press play to listen to the full Surah.",
+                description="👤 **Reciter:** Mahmoud Khalil Al-Husary\n🌍 **Translation Language:** ❌ ไม่แปล (No Translation)\n\nUse the selection menu to choose a Reciter. You can set an Ayah range, or directly press play to listen to the full Surah.",
                 color=discord.Color.green()
             )
             embed.set_footer(text=f"Requested by {interaction.user.display_name}")
