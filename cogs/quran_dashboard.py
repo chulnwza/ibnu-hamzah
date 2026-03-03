@@ -158,20 +158,12 @@ class QuranDashboardView(discord.ui.View):
             if self.is_full_quran:
                 self.play_task = asyncio.create_task(self.play_full_quran_loop(interaction, voice_client, reciter_config["quran_com"]))
                 await interaction.edit_original_response(content="Starting Full Quran recitation...")
-            elif self.selected_language == 'none' and (self.start_ayah is None or self.end_ayah is None):
-                # Play full surah efficiently natively
-                audio_url = await get_full_surah_audio(self.surah_number, reciter_config["quran_com"])
-                if not audio_url:
-                    await interaction.edit_original_response(content="Could not retrieve full Surah audio URL.")
-                    return
-                
-                if audio_url.startswith("//"):
-                    audio_url = "https:" + audio_url
-                    
-                voice_client.play(discord.FFmpegPCMAudio(audio_url))
-                await interaction.edit_original_response(content=f"Playing full Surah {self.surah_number}...")
+            elif self.start_ayah is None and self.end_ayah is None:
+                # Play full surah gaplessly directly from source MP3
+                self.play_task = asyncio.create_task(self.play_full_surah(interaction, voice_client, reciter_config["quran_com"]))
+                await interaction.edit_original_response(content=f"Preparing to play full Surah {self.surah_number} gaplessly...")
             else:
-                # Play range or Ayah-by-Ayah for translations
+                # Play range looping fetching translations explicitly Ayah-by-Ayah
                 self.audio_queue = []
                 self.play_task = asyncio.create_task(self.play_queue(interaction, voice_client, reciter_config["aladhan"]))
                 start_str = self.start_ayah if self.start_ayah else 1
@@ -180,6 +172,38 @@ class QuranDashboardView(discord.ui.View):
                 
         except Exception as e:
             await interaction.edit_original_response(content=f"An error occurred: {e}")
+
+    async def play_full_surah(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, reciter_id: int):
+        try:
+            audio_url = await get_full_surah_audio(self.surah_number, reciter_id)
+            if not audio_url:
+                await interaction.edit_original_response(content="Could not retrieve full Surah audio URL.")
+                return
+            
+            if audio_url.startswith("//"):
+                audio_url = "https:" + audio_url
+                
+            # Update Embed
+            try:
+                embed = interaction.message.embeds[0]
+                rec_name = RECITER_MAPPING.get(self.selected_reciter, {"name": "Unknown"})["name"]
+                lang_display = TRANSLATION_MAPPING.get(self.selected_language, {"name": "❌ ไม่แปล (No Translation)"})["name"]
+                
+                new_desc = f"👤 **Reciter:** {rec_name}\n🌍 **Translation Language:** {lang_display}\n\n▶️ **Playing Full Surah Continuously**"
+                embed.description = new_desc
+                await interaction.edit_original_response(embed=embed, view=self)
+            except Exception as e:
+                pass
+                
+            voice_client.play(discord.FFmpegPCMAudio(audio_url, before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5", options="-vn"))
+            
+            while voice_client.is_playing():
+                await asyncio.sleep(0.5)
+                if self.stop_event.is_set():
+                    break
+                    
+        except Exception as e:
+            print(f"Failed to play full Surah {self.surah_number}: {e}")
 
     async def play_full_quran_loop(self, interaction: discord.Interaction, voice_client: discord.VoiceClient, reciter_id: int):
         while self.current_surah <= 114:
